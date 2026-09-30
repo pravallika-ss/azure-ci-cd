@@ -1,0 +1,95 @@
+trigger:
+  - main
+
+variables:
+  # The names of your Service Connections in Azure DevOps
+  azureServiceConnection: 'Azure-Service-Connection'
+  acrServiceConnection: 'ACR-Service-Connection'
+  
+  # Your specific Azure names
+  resourceGroup: 'MyCloudResourceGroup'
+  acrName: 'myuniqueacr2026'
+  acrLoginServer: 'myuniqueacr2026.azurecr.io'
+  imageRepository: 'webapp'
+  aciName: 'my-test-app-aci'
+  aksName: 'myAKSCluster'
+
+stages:
+# STAGE 1: Build Docker Image and Push to ACR
+- stage: BuildAndPush
+  displayName: 'Build and Push to ACR'
+  jobs:
+  - job: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: Docker@2
+      displayName: 'Build and Push Image to ACR'
+      inputs:
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageRepository)'
+        command: 'buildAndPush'
+        Dockerfile: '**/Dockerfile'
+        tags: |
+          $(Build.BuildId)
+          latest
+
+# STAGE 2: Deploy to ACI (Staging Test)
+- stage: DeployToACI
+  displayName: 'Test Deployment in ACI'
+  dependsOn: BuildAndPush
+  jobs:
+  - job: ACIDeploy
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Run Image on Azure Container Instance'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          ACR_PASSWORD=$(az acr credential show --name $(acrName) --query "passwords.value" -o tsv)
+          az container create \
+            --resource-group $(resourceGroup) \
+            --name $(aciName) \
+            --image $(acrLoginServer)/$(imageRepository):$(Build.BuildId) \
+            --cpu 1 \
+            --memory 1.5Gi \
+            --registry-login-server $(acrLoginServer) \
+            --registry-username $(acrName) \
+            --registry-password $ACR_PASSWORD \
+            --dns-name-label my-web-app-test-dns \
+            --ports 80
+
+# STAGE 3: Production Deployment to AKS Cluster
+- stage: DeployToAKS
+  displayName: 'Deploy to AKS Cluster'
+  dependsOn: DeployToACI
+  jobs:
+  - job: AKSDeploy
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureAKS@1
+      displayName: 'Set AKS Context'
+      inputs:
+        azureSubscriptionEndpoint: '$(azureServiceConnection)'
+        azureResourceGroup: '$(resourceGroup)'
+        kubernetesCluster: '$(aksName)'
+        command: 'login'
+
+    - task: bash@3
+      displayName: 'Replace Build ID token in Manifest'
+      inputs:
+        targetType: 'inline'
+        script: |
+          sed -i "s|__IMAGE_TAG__|$(Build.BuildId)|g" deployment.yaml
+
+    - task: KubernetesManifest@1
+      displayName: 'Deploy Manifests to AKS'
+      inputs:
+        action: 'deploy'
+        manifests: 'deployment.yaml'
+
